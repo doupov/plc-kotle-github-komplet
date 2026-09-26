@@ -1,0 +1,430 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -12,6 +12,15 @@
+ static safety::Freshness nt48_freshness;
+ static safety::Valve valve;
+ static bool overheat_active = false;
++enum class SensorMode : uint8_t { NORMAL, SENSOR_FAIL, NT48_LOST };
++static SensorMode sensor_mode = SensorMode::NORMAL;
++static safety::DisplayBackoff display_link;
++static uint8_t pending_temp = 7; // No old/stale temperature batch before a valid read.
++static uint32_t lastPollNT48 = 0;
++static bool nt48_poll_started = false;
++static bool nt48_ever_received = false;
++static uint32_t nt48_started_ms = 0;
++static constexpr uint32_t POLL_NT48_MS = 3000;
+ 
+ // StamPLC zapojení RS485 transceiveru (DE/RE/TXEN)
+ RS485Class RS485(Serial2, 39, 0, 46, -1);
+@@ -144,7 +153,21 @@
+   d.setCursor(8, 130);
+   d.printf("NT48: %s | alarm: %s", nt48_freshness.current(millis()) ? "FRESH" : "STALE",
+            overheat_active ? "ON" : "OFF");
++  d.setCursor(8, 142);
++  d.printf("mode: %s | Dial: %s", sensor_mode == SensorMode::NT48_LOST ? "NT48_LOST" :
++           sensor_mode == SensorMode::SENSOR_FAIL ? "SENSOR_FAIL" : "NORMAL",
++           display_link.offline ? "OFFLINE" : "ONLINE");
+   d.endWrite();
++}
++
++static void serviceLocalUI() {
++  if (valve.busy()) return;
++  M5.update();
++  static uint32_t last_ui_ms = 0;
++  if (safety::expired(millis(), last_ui_ms, 1000)) {
++    last_ui_ms = millis();
++    drawUI();
++  }
+ }
+ 
+ // ---------- ČTENÍ NT48A08: Holding 0..7, /10 ----------
+@@ -156,6 +179,8 @@
+     return false; // Keep historical values; their freshness expires independently.
+   }
+   nt48_freshness.success(millis());
++  nt48_ever_received = true;
++  pending_temp = 0;
+ 
+   auto f = [](int16_t v)->float{
+     float x = v / 10.0f;
+@@ -184,7 +209,7 @@
+   return (int16_t)v;
+ }
+ 
+-static void pushTempsToDial() {
++static bool pushTempsToDial() {
+   // pošleme naměřené teploty z NT48 do Dial HR jako INT °C (žádné ×10)
+   struct { uint16_t addr; float val; const char* name; } wr[] = {
+     { HR_KOTEL_TEMP,  t_nt_kotel,     "HR_KOTEL_TEMP"  },
+@@ -196,19 +221,18 @@
+     { HR_KOTEL_TEMP2, t_nt_kotel,     "HR_KOTEL_TEMP2" },
+   };
+ 
+-  for (auto &w : wr) {
+-    if (!isPlausibleTemp(w.val)) {
+-      Serial.printf("[DIAL] skip %s (N/A)\n", w.name);
+-      continue;
+-    }
+-    int16_t v = round_to_i16(w.val);           // INT °C
++  while (pending_temp < 7) {
++    const auto& w = wr[pending_temp++];
++    if (!isPlausibleTemp(w.val)) continue;
++    const int16_t v = round_to_i16(w.val);
+     if (!ModbusRTUClient.holdingRegisterWrite(DIAL_ID, w.addr, (uint16_t)v)) {
+       Serial.printf("[DIAL] FAIL write %s @%u\n", w.name, w.addr);
+-      break; // Offline panel: do not wait for seven consecutive timeouts.
+-    } else {
+-      Serial.printf("[DIAL] write %s = %d (INT °C)\n", w.name, v);
+-    }
+-  }
++      display_link.failed(millis());
++      pending_temp = 7;
++    }
++    return true; // Only ONE synchronous transaction before returning to safety control.
++  }
++  return false;
+ }
+ 
+ // ---------- ČTENÍ DIAL: HR (INT °C) ----------
+@@ -222,9 +246,11 @@
+   const auto result = safety::readRegisters(ModbusRTUClient, DIAL_ID, HOLDING_REGISTERS, HR_KOTEL_TEMP, hr);
+   if (result != safety::FrameResult::OK) {
+     Serial.println(result == safety::FrameResult::FAIL ? "[DIAL] FAIL/timeout/frame error" : "[DIAL] PARTIAL");
++    display_link.completeRead(millis(), false);
+     return false;
+   }
+ 
++  display_link.completeRead(millis(), true);
+   d_kotel_temp = hrToC(hr[0]);
+   d_tank_top   = hrToC(hr[1]);
+   d_tank_mid   = hrToC(hr[2]);
+@@ -248,12 +274,13 @@
+ static bool writeDial_Coil(uint16_t addr, bool on) {
+   if (!ModbusRTUClient.coilWrite(DIAL_ID, addr, on ? 0xFF : 0x00)) {
+     Serial.printf("[DIAL] coilWrite addr %u FAIL\n", addr);
++    display_link.failed(millis());
+     return false;
+   }
+   return true;
+ }
+-static void signalPumpsToDial(bool kotel_on, bool topeni_on, bool boiler_on) {
+-  if (valve.busy()) return; // No blocking Modbus while a pulse/deadtime is active.
++static bool signalPumpsToDial(bool kotel_on, bool topeni_on, bool boiler_on) {
++  if (valve.busy()) return false; // No blocking Modbus while a pulse/deadtime is active.
+   static bool sent[3] = {};
+   static bool known[3] = {};
+   static bool attempted[3] = {};
+@@ -273,8 +300,23 @@
+     } else {
+       known[i] = false; // Retry failed writes even if desired state returns to old value.
+     }
+-    break; // At most one transaction per loop; retries limited to 1 s per coil.
+-  }
++    return true; // At most one transaction per loop; retries limited to 1 s per coil.
++  }
++  return false;
++}
++
++// Display is last priority. All paths share backoff, including temperature/coils.
++// Offline: read-only probe every 10 s; only a complete read restores ONLINE.
++static bool serviceDisplay(bool kotel_on, bool topeni_on, bool boiler_on) {
++  if (valve.busy() || (valve.emergency_latched &&
++      valve.state != safety::Valve::State::EMERGENCY_HOLD)) return false;
++  const uint32_t now = millis();
++  if (!nt48_poll_started || safety::expired(now, lastPollNT48, POLL_NT48_MS)) return false;
++  if (display_link.due(now)) { readDial_Holding(); return true; }
++  if (display_link.offline) return false;
++  if (signalPumpsToDial(kotel_on, topeni_on, boiler_on)) return true;
++  if (nt48_freshness.current(millis())) return pushTempsToDial();
++  return false;
+ }
+ 
+ // ===================== SETUP / LOOP =====================
+@@ -303,45 +345,28 @@
+     while (1) delay(1000);
+   }
+ 
+-  // Po startu první cyklus
+-  if (readNT48()) {          // načti z NT48 (float °C)
+-    pushTempsToDial();       // a zapiš do Dialu (HR = INT °C)
+-  }
+-  readDial_Holding();        // stáhni SETy/ACT (INT °C)
+-
+-  // Inicializace UI
+-  drawUI();
+-}
+-
+-uint32_t lastPollNT48 = 0;
+-uint32_t lastPollDial = 0;
+-const uint32_t POLL_NT48_MS = 3000;  // 3 s
+-const uint32_t POLL_DIAL_MS = 1000;  // 1 s
++  nt48_started_ms = millis();
++  // First loop polls NT48 and applies control before any Display transaction.
++}
+ 
+ void loop() {
+   uint32_t now = millis();
+ 
+-  // Keep pulse servicing free of synchronous Modbus, UI and M5 operations.
+-  if (!valve.busy()) {
+-    valve_outputs.run(false); // Reassert STOP; relay API has no write-success result.
+-    M5.update();
+-
+-    // Periodické čtení NT48 a PUSH do Dialu (HR = INT °C)
+-    if (now - lastPollNT48 >= POLL_NT48_MS) {
+-      lastPollNT48 = now;
+-      if (readNT48()) {
+-        pushTempsToDial();  // NT48 -> Dial HR (INT)
+-      }
+-    }
+-
+-    // Periodické čtení Dial (HR) – kvůli setpointům
+-    if (now - lastPollDial >= POLL_DIAL_MS) {
+-      lastPollDial = now;
+-      readDial_Holding();
+-    }
+-
+-  } // communication only while RUN is OFF
+-  now = millis(); // Transactions may have consumed time; freshness uses completion time.
++  // 1. Service motor deadline before any potentially blocking operation.
++  valve.service(now, valve_outputs);
++
++  // 2. NT48 has priority. Emergency motion pauses for the synchronous read;
++  // its single episode keeps the accumulated ON-time budget (no 1 s/15 s cycling).
++  if (!nt48_poll_started || safety::expired(now, lastPollNT48, POLL_NT48_MS)) {
++    if (valve.emergency_latched) valve.pauseEmergency(now, valve_outputs);
++    if (!valve.busy()) {
++      valve_outputs.run(false);
++      readNT48();
++      lastPollNT48 = millis();
++      nt48_poll_started = true;
++    }
++  }
++  now = millis();
+ 
+   // ====== AUTO ŘÍZENÍ – logika s hysterezí a failsafe ======
+ 
+@@ -361,34 +386,48 @@
+ 
+   // 2) ALARM přehřátí (NT48 senzor!)
+   const bool was_alarm = overheat_active;
+-  overheat_active = safety::updateAlarm(overheat_active, !any_invalid, t_nt_tank_top);
++  const bool tank_alarm_valid = fresh && valid_tankT;
++  overheat_active = safety::updateAlarm(overheat_active, tank_alarm_valid, t_nt_tank_top);
+   const bool alarm = overheat_active;
+-  if (alarm && !was_alarm) valve.stop(now, valve_outputs);
+-  // Refresh diagnostics even when BOTH devices are offline, only with motor stopped.
+-  static uint32_t last_ui_ms = 0;
+-  if (!valve.busy() && safety::expired(now, last_ui_ms, 1000)) {
+-    last_ui_ms = now;
+-    drawUI();
+-  }
+-
+-  // 3) Failsafe větev
++  if (alarm && !was_alarm && !valve.emergency_latched) valve.stop(now, valve_outputs);
++  sensor_mode = !fresh ? SensorMode::NT48_LOST :
++                any_invalid ? SensorMode::SENSOR_FAIL : SensorMode::NORMAL;
++  // At boot, allow the same 12 s acquisition window before blind emergency motion.
++  const bool long_communication_loss = !fresh && (nt48_ever_received ||
++    safety::expired(now, nt48_started_ms, safety::NT48_STALE_TIMEOUT_MS));
++  const bool complete_sensor_loss = long_communication_loss || (fresh &&
++    !(valid_kotel || valid_tankT || valid_tankM || valid_topeni || valid_boiler));
++
++  // 3. Control/fault actions before Display. Individual sensor errors retain STOP;
++  // complete loss starts a single bounded emergency travel, only rearmed by full recovery.
+   if (any_invalid) {
+-    kotel_on  = true;
+-    topeni_on = true;
+-    boiler_on = true;
+-    valve.stop(now, valve_outputs);
+-
+-    // Zápis výstupů (NC mapování zachováno)
+-    writeRelay12(0, !kotel_on);   // R1 KOTEL (NC)
+-    writeRelay12(1, !topeni_on);  // R2 TOPENI (NC)
+-    gpioR3_write(boiler_on);      // PORTA G1 (Boiler pump)
+-
+-    // Signalizace pump do DIAL (coils)
+-    signalPumpsToDial(kotel_on, topeni_on, boiler_on);
+-
++    kotel_on = topeni_on = boiler_on = true;
++    if (!valve.busy()) {
++      writeRelay12(0, !kotel_on);
++      writeRelay12(1, !topeni_on);
++    }
++    gpioR3_write(boiler_on);
++    if (complete_sensor_loss) {
++      if (!valve.emergency_latched) {
++        valve.stop(now, valve_outputs);
++        writeRelay12(0, !kotel_on);
++        writeRelay12(1, !topeni_on);
++        valve.startEmergencyTravel(millis(), valve_outputs);
++      }
++      valve.updateEmergency(millis(), valve_outputs);
++    } else {
++      if (valve.emergency_latched) valve.holdEmergency(now, valve_outputs);
++      else valve.stop(now, valve_outputs);
++      writeRelay12(0, !kotel_on);
++      writeRelay12(1, !topeni_on);
++    }
++    if (!valve.busy()) valve_outputs.run(false);
++    serviceLocalUI();
++    serviceDisplay(kotel_on, topeni_on, boiler_on);
+     delay(5);
+     return;
+   }
++  if (valve.emergency_latched) valve.recover(now, valve_outputs);
+ 
+   // 4) KOTEL (primární okruh) – absolutní prahy + původní hystereze
+ 
+@@ -449,11 +488,13 @@
+   }
+   gpioR3_write(boiler_on);      // PORTA G1 (Boiler pump)
+ 
+-  // Service after pump writes; no blocking work may follow a newly started pulse.
+-  valve.update(millis(), wanted, valve_outputs);
+-
+-  // 10) Signalizace pump do DIAL (coils) – pouze informace
+-  signalPumpsToDial(kotel_on, topeni_on, boiler_on);
+-
++  // 4. Display last, at most one transaction; always reevaluate control in the
++  // next loop after a transaction rather than start a pulse from pre-call data.
++  if (!valve.busy()) {
++    valve_outputs.run(false);
++    serviceLocalUI();
++  }
++  if (!serviceDisplay(kotel_on, topeni_on, boiler_on))
++    valve.update(millis(), wanted, valve_outputs);
+   delay(5);
+ }
+--- a/include/control_safety.h
++++ b/include/control_safety.h
+@@ -23,7 +23,8 @@
+ constexpr uint32_t NT48_STALE_TIMEOUT_MS = 12000;
+ constexpr float OVERHEAT_ENTER_TEMP = 85.0f; // Preserve original strict > 85 activation.
+ constexpr float OVERHEAT_EXIT_TEMP = 82.0f;  // 3 C hysteresis; release at <= 82.
+-// Same as the existing default heating target; verify suitability of the heat dump.
++// TODO: Verify that 60 C radiator supply provides sufficient emergency heat-dump
++// capacity for the actual boiler/system. Target unchanged.
+ constexpr float ALARM_DUMP_SUPPLY_SETPOINT = 60.0f;
+ static_assert(VALVE_PULSE_MS > 0 && VALVE_PULSE_MS < 0x80000000UL, "pulse interval");
+ static_assert(VALVE_SETTLE_MS > 0 && VALVE_SETTLE_MS < 0x80000000UL, "settle interval");
+@@ -31,6 +32,14 @@
+ static_assert(OVERHEAT_EXIT_TEMP < OVERHEAT_ENTER_TEMP, "alarm hysteresis");
+ 
+ enum class Direction : uint8_t { STOP, OPEN_HOT, CLOSE_HOT };
++// VERIFY WITH ACTUAL SERVO FULL-TRAVEL TIME: 120 s is the previously assumed
++// actuator travel, not an identified specification. Requires working end stops.
++// Total commanded motor ON time per fault episode; NT48 polling pauses are excluded.
++constexpr uint32_t VALVE_EMERGENCY_TRAVEL_MS = 120000;
++constexpr Direction VALVE_EMERGENCY_DIRECTION = Direction::OPEN_HOT; // R4 HIGH, unchanged.
++static_assert(VALVE_EMERGENCY_DIRECTION != Direction::STOP, "emergency requires a travel direction");
++static_assert(VALVE_EMERGENCY_TRAVEL_MS > 0 && VALVE_EMERGENCY_TRAVEL_MS < 0x80000000UL,
++              "emergency travel interval");
+ inline Direction demand(bool enabled, float actual, float target, float hyst) {
+   if (!enabled || !isfinite(actual) || !isfinite(target)) return Direction::STOP;
+   if (actual < target - hyst) return Direction::OPEN_HOT;
+@@ -41,17 +50,76 @@
+ // Sink exposes run(bool), direction(Direction). No electrical polarity in control.
+ class Valve {
+ public:
+-  enum class State : uint8_t { IDLE, DEADTIME, PULSE, SETTLING };
++  enum class State : uint8_t { IDLE, DEADTIME, PULSE, SETTLING,
++    EMERGENCY_DEADTIME, EMERGENCY_TRAVEL, EMERGENCY_PAUSED, EMERGENCY_HOLD };
+   State state = State::IDLE;
+   Direction direction = Direction::STOP;
+   uint32_t started = 0;
+-  bool busy() const { return state == State::PULSE || state == State::DEADTIME; }
++  bool emergency_latched = false;
++  uint32_t emergency_run_ms = 0; // Sum of completed ON segments, never a countdown.
++  bool busy() const {
++    return state == State::PULSE || state == State::DEADTIME ||
++           state == State::EMERGENCY_TRAVEL || state == State::EMERGENCY_DEADTIME;
++  }
++  template<class Sink> void pauseEmergency(uint32_t now, Sink& out) {
++    if (state != State::EMERGENCY_TRAVEL && state != State::EMERGENCY_DEADTIME) return;
++    out.run(false);
++    if (state == State::EMERGENCY_TRAVEL) {
++      const uint32_t segment = elapsed(now, started);
++      const uint32_t budget = VALVE_EMERGENCY_TRAVEL_MS - emergency_run_ms;
++      emergency_run_ms += segment < budget ? segment : budget;
++    }
++    state = emergency_run_ms >= VALVE_EMERGENCY_TRAVEL_MS ? State::EMERGENCY_HOLD
++                                                        : State::EMERGENCY_PAUSED;
++  }
++  template<class Sink> void service(uint32_t now, Sink& out) {
++    // Called FIRST in loop; only stop here, never start before processing sensors.
++    if (state == State::PULSE && expired(now, started, VALVE_PULSE_MS)) stop(now, out);
++    if (state == State::EMERGENCY_TRAVEL &&
++        expired(now, started, VALVE_EMERGENCY_TRAVEL_MS - emergency_run_ms))
++      pauseEmergency(now, out);
++  }
++  template<class Sink> void startEmergencyTravel(uint32_t now, Sink& out) {
++    if (emergency_latched) return; // HOLD cannot restart itself, even after hours.
++    out.run(false);
++    emergency_latched = true;
++    emergency_run_ms = 0;
++    direction = VALVE_EMERGENCY_DIRECTION;
++    out.direction(direction);
++    started = now;
++    state = State::EMERGENCY_DEADTIME;
++  }
++  template<class Sink> void updateEmergency(uint32_t now, Sink& out) {
++    service(now, out);
++    if (state == State::EMERGENCY_PAUSED) {
++      out.run(false);
++      out.direction(direction);
++      started = now;
++      state = State::EMERGENCY_DEADTIME;
++    } else if (state == State::EMERGENCY_DEADTIME &&
++               expired(now, started, VALVE_DIRECTION_DEADTIME_MS)) {
++      started = now;
++      state = State::EMERGENCY_TRAVEL;
++      out.run(true);
++    }
++  }
++  template<class Sink> void holdEmergency(uint32_t now, Sink& out) {
++    pauseEmergency(now, out);
++    out.run(false);
++    state = State::EMERGENCY_HOLD; // Partial recovery stops travel, keeps episode latch.
++  }
++  template<class Sink> void recover(uint32_t now, Sink& out) {
++    pauseEmergency(now, out);
++    emergency_latched = false;
++    stop(now, out); // STOP + settling before any normal reversal.
++  }
+   template<class Sink> void stop(uint32_t now, Sink& out) {
+     out.run(false);
+     if (state != State::SETTLING) started = now;
+     state = State::SETTLING;
+   }
+   template<class Sink> void update(uint32_t now, Direction wanted, Sink& out) {
++    if (emergency_latched) return;
+     if (state == State::PULSE) {
+       if (wanted != direction || expired(now, started, VALVE_PULSE_MS)) stop(now, out);
+       return;
+@@ -75,6 +143,25 @@
+     direction = wanted;
+     started = now;
+     state = State::DEADTIME;
++  }
++};
++
++constexpr uint32_t DISPLAY_POLL_MS = 1000;
++constexpr uint32_t DISPLAY_OFFLINE_RETRY_MS = 10000;
++struct DisplayBackoff {
++  uint8_t failures = 0;
++  bool offline = false;
++  uint32_t last_read_ms = 0;
++  bool due(uint32_t now) const {
++    return expired(now, last_read_ms, offline ? DISPLAY_OFFLINE_RETRY_MS : DISPLAY_POLL_MS);
++  }
++  void failed(uint32_t now) {
++    if (failures < 3) ++failures;
++    if (failures >= 3 && !offline) { offline = true; last_read_ms = now; }
++  }
++  void completeRead(uint32_t now, bool ok) {
++    last_read_ms = now; // Space retries from completion, including synchronous timeout.
++    if (ok) { failures = 0; offline = false; } else failed(now);
+   }
+ };
+ 

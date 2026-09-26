@@ -1,0 +1,16 @@
+{
+	"folders": [
+		{
+			"path": "../../../../gps/new/gps"
+		},
+		{
+			"name": "RadioS3",
+			"path": "../../RadioS3"
+		},
+		{
+			"name": "Display",
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

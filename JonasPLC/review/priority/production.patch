@@ -1,0 +1,153 @@
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -12,6 +12,9 @@
+ static safety::Freshness nt48_freshness;
+ static safety::Valve valve;
+ static bool overheat_active = false;
++static bool modbus_ready = false;
++static uint32_t last_modbus_init_attempt_ms = 0;
++static constexpr uint32_t MODBUS_INIT_RETRY_MS = 5000;
+ enum class SensorMode : uint8_t { NORMAL, SENSOR_FAIL, NT48_LOST };
+ static SensorMode sensor_mode = SensorMode::NORMAL;
+ static safety::DisplayBackoff display_link;
+@@ -308,7 +311,7 @@
+ // Display is last priority. All paths share backoff, including temperature/coils.
+ // Offline: read-only probe every 10 s; only a complete read restores ONLINE.
+ static bool serviceDisplay(bool kotel_on, bool topeni_on, bool boiler_on) {
+-  if (valve.busy() || (valve.emergency_latched &&
++  if (!modbus_ready || valve.busy() || (valve.emergency_latched &&
+       valve.state != safety::Valve::State::EMERGENCY_HOLD)) return false;
+   const uint32_t now = millis();
+   if (!nt48_poll_started || safety::expired(now, lastPollNT48, POLL_NT48_MS)) return false;
+@@ -319,6 +322,18 @@
+   return false;
+ }
+ 
++static bool tryInitModbus(uint32_t now) {
++  last_modbus_init_attempt_ms = now;
++  modbus_ready = ModbusRTUClient.begin(MODBUS_BAUD, SERIAL_8N1);
++  if (modbus_ready) {
++    nt48_poll_started = false; // Acquisition, not begin(), determines sensor health.
++    Serial.println(F("[MODBUS] initialized"));
++  } else {
++    Serial.println(F("[MODBUS] init failed; safety mode active"));
++  }
++  return modbus_ready;
++}
++
+ // ===================== SETUP / LOOP =====================
+ void setup() {
+   Serial.begin(115200);
+@@ -339,13 +354,8 @@
+   // PORTA G1 (čerpadlo boiler)
+   gpioR3_init();
+ 
+-  // Spusť Modbus RTU klienta (řeší RS485 směrování přes RS485Class)
+-  if (!ModbusRTUClient.begin(MODBUS_BAUD, SERIAL_8N1)) {
+-    Serial.println(F("Failed to start Modbus RTU Client"));
+-    while (1) delay(1000);
+-  }
+-
+   nt48_started_ms = millis();
++  tryInitModbus(nt48_started_ms); // Failure must still enter loop and pump failsafe.
+   // First loop polls NT48 and applies control before any Display transaction.
+ }
+ 
+@@ -355,9 +365,19 @@
+   // 1. Service motor deadline before any potentially blocking operation.
+   valve.service(now, valve_outputs);
+ 
++  // Initialization may block too: pause the SAME emergency episode before retry.
++  if (!modbus_ready && safety::expired(now, last_modbus_init_attempt_ms, MODBUS_INIT_RETRY_MS)) {
++    if (valve.emergency_latched) valve.pauseEmergency(now, valve_outputs);
++    if (!valve.busy()) {
++      valve_outputs.run(false);
++      tryInitModbus(now);
++    }
++  }
++  now = millis();
++
+   // 2. NT48 has priority. Emergency motion pauses for the synchronous read;
+   // its single episode keeps the accumulated ON-time budget (no 1 s/15 s cycling).
+-  if (!nt48_poll_started || safety::expired(now, lastPollNT48, POLL_NT48_MS)) {
++  if (modbus_ready && (!nt48_poll_started || safety::expired(now, lastPollNT48, POLL_NT48_MS))) {
+     if (valve.emergency_latched) valve.pauseEmergency(now, valve_outputs);
+     if (!valve.busy()) {
+       valve_outputs.run(false);
+@@ -371,7 +391,7 @@
+   // ====== AUTO ŘÍZENÍ – logika s hysterezí a failsafe ======
+ 
+   // 1) Validace měření (failsafe ON pokud něco chybí)
+-  const bool fresh = nt48_freshness.current(now);
++  const bool fresh = modbus_ready && nt48_freshness.current(now);
+   bool valid_kotel   = isPlausibleTemp(t_nt_kotel);
+   bool valid_tankT   = isPlausibleTemp(t_nt_tank_top);
+   bool valid_tankM   = isPlausibleTemp(t_nt_tank_mid);
+@@ -389,6 +409,7 @@
+   const bool tank_alarm_valid = fresh && valid_tankT;
+   overheat_active = safety::updateAlarm(overheat_active, tank_alarm_valid, t_nt_tank_top);
+   const bool alarm = overheat_active;
++  const bool heat_dump_feedback_valid = fresh && valid_tankT && valid_topeni;
+   if (alarm && !was_alarm && !valve.emergency_latched) valve.stop(now, valve_outputs);
+   sensor_mode = !fresh ? SensorMode::NT48_LOST :
+                 any_invalid ? SensorMode::SENSOR_FAIL : SensorMode::NORMAL;
+@@ -397,6 +418,25 @@
+     safety::expired(now, nt48_started_ms, safety::NT48_STALE_TIMEOUT_MS));
+   const bool complete_sensor_loss = long_communication_loss || (fresh &&
+     !(valid_kotel || valid_tankT || valid_tankM || valid_topeni || valid_boiler));
++
++  // A. Confirmed overheat with usable supply feedback outranks unrelated faults.
++  if (alarm && heat_dump_feedback_valid) {
++    kotel_on = topeni_on = boiler_on = true;
++    if (valve.emergency_latched) valve.recover(now, valve_outputs);
++    if (!valve.busy()) {
++      writeRelay12(0, !kotel_on);
++      writeRelay12(1, !topeni_on);
++    }
++    gpioR3_write(boiler_on);
++    const auto wanted = safety::demand(true, t_nt_topeni,
++                                      safety::ALARM_DUMP_SUPPLY_SETPOINT, topeni_hyst);
++    valve.update(millis(), wanted, valve_outputs);
++    if (!valve.busy()) valve_outputs.run(false);
++    serviceLocalUI();
++    serviceDisplay(kotel_on, topeni_on, boiler_on);
++    delay(5);
++    return;
++  }
+ 
+   // 3. Control/fault actions before Display. Individual sensor errors retain STOP;
+   // complete loss starts a single bounded emergency travel, only rearmed by full recovery.
+@@ -473,13 +513,7 @@
+     }
+   }
+ 
+-  // 7/8) Alarm retains pump override, but regulates supply to an explicit target.
+-  // BEHAVIOR CHANGE: hysteretic alarm + bounded heat-dump supply regulation.
+-  if (alarm) {
+-    kotel_on = topeni_on = boiler_on = true;
+-  }
+-  const float valve_target = alarm ? safety::ALARM_DUMP_SUPPLY_SETPOINT : d_topeni_set;
+-  const auto wanted = safety::demand(topeni_on, t_nt_topeni, valve_target, topeni_hyst);
++  const auto wanted = safety::demand(topeni_on, t_nt_topeni, d_topeni_set, topeni_hyst);
+ 
+   // 9) Zápis výstupů (NC mapování pro KOTEL/TOPENI)
+   if (!valve.busy()) { // Avoid repeated I2C writes during the timed movement.
+@@ -488,13 +522,10 @@
+   }
+   gpioR3_write(boiler_on);      // PORTA G1 (Boiler pump)
+ 
+-  // 4. Display last, at most one transaction; always reevaluate control in the
+-  // next loop after a transaction rather than start a pulse from pre-call data.
+-  if (!valve.busy()) {
+-    valve_outputs.run(false);
+-    serviceLocalUI();
+-  }
+-  if (!serviceDisplay(kotel_on, topeni_on, boiler_on))
+-    valve.update(millis(), wanted, valve_outputs);
++  // Actuator decision FIRST; busy() gates local UI and synchronous Display I/O.
++  valve.update(millis(), wanted, valve_outputs);
++  if (!valve.busy()) valve_outputs.run(false);
++  serviceLocalUI();
++  serviceDisplay(kotel_on, topeni_on, boiler_on);
+   delay(5);
+ }

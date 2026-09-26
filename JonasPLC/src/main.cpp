@@ -1,0 +1,534 @@
+// ===================== StamPLC Master: NT48A08 + M5Dial (Dial HR = INT °C) =====================
+#include <Arduino.h>
+#include <M5Unified.h>
+#include <M5StamPLC.h>
+
+// ---------- RS485 / Modbus ----------
+#include <ArduinoModbus.h>
+#include <ArduinoRS485.h>
+#include <cmath>
+#include "control_safety.h"
+
+static safety::Freshness nt48_freshness;
+static safety::Valve valve;
+static bool overheat_active = false;
+static bool modbus_ready = false;
+static uint32_t last_modbus_init_attempt_ms = 0;
+static constexpr uint32_t MODBUS_INIT_RETRY_MS = 5000;
+enum class SensorMode : uint8_t { NORMAL, SENSOR_FAIL, NT48_LOST };
+static SensorMode sensor_mode = SensorMode::NORMAL;
+static safety::DisplayBackoff display_link;
+static uint8_t pending_temp = 7; // No old/stale temperature batch before a valid read.
+static uint32_t lastPollNT48 = 0;
+static bool nt48_poll_started = false;
+static bool nt48_ever_received = false;
+static uint32_t nt48_started_ms = 0;
+static constexpr uint32_t POLL_NT48_MS = 3000;
+
+// StamPLC zapojení RS485 transceiveru (DE/RE/TXEN)
+RS485Class RS485(Serial2, 39, 0, 46, -1);
+static const uint32_t MODBUS_BAUD = 9600;
+static const uint8_t  DIAL_ID     = 1;   // M5Stack Dial (slave)
+static const uint8_t  NT48_ID     = 2;   // NT48A08 (slave)
+
+// ---------- PORT A – G1 = GPIO1 (čerpadlo boileru) ----------
+#ifndef PORTA_G1_GPIO
+  #define PORTA_G1_GPIO 1   // Stamp-S3: Port A G1 = GPIO 1 (SDA)
+#endif
+
+// ====== Modbus mapování registrů (M5Dial) ======
+enum : uint16_t {
+  HR_KOTEL_TEMP = 0,
+  HR_TANK_TOP   = 1,
+  HR_TANK_MID   = 2,
+  HR_TANK_DOWN  = 3,
+  HR_TOPENI_ACT = 4,
+  HR_TOPENI_SET = 5,
+  HR_BOILER_ACT = 6,
+  HR_BOILER_SET = 7,
+  HR_KOTEL_TEMP2 = 8,
+};
+enum : uint16_t {
+  CO_KOTEL_PUMP  = 0,  // signalizace → DIAL coil 0
+  CO_TOPENI_PUMP = 1,  // signalizace → DIAL coil 1
+  CO_BOILER_PUMP = 2,  // signalizace → DIAL coil 2
+};
+
+// Popisky pro UI
+#define RELAY1_CONTACT "NC"
+#define RELAY2_CONTACT "NC"
+#define RELAY3_CONTACT "NO (PORTA G1)"
+
+// ---------- Počáteční stavy výstupů ----------
+static bool relay_state[4] = { false, false, false, false }; // R1..R4
+
+// Tlačítka A/B/C přepínají ruční režim jednotlivých čerpadel.
+// Po startu jsou všechna čerpadla v automatickém režimu.
+static bool pump_force_on[3] = { false, false, false };
+
+// ---------- Globální teploty (°C) z NT48 ----------
+static float t_nt_tank_top   = NAN; // CH01
+static float t_nt_tank_mid   = NAN; // CH02
+static float t_nt_tank_down  = NAN; // CH03
+static float t_nt_topeni     = NAN; // CH04
+static float t_nt_boiler     = NAN; // CH05
+static float t_nt_kotel      = NAN; // CH06
+
+// ---------- Hodnoty z Dialu (HR = INT °C) ----------
+static float d_kotel_temp    = NAN;
+static float d_tank_top      = NAN;
+static float d_tank_mid      = NAN;
+static float d_tank_down     = NAN;
+static float d_topeni_act    = NAN;
+// BEHAVIOR CHANGE: bounded Display defaults until the first valid panel read.
+static float d_topeni_set    = 60;  // SET (Dial -> StamPLC)
+static float d_boiler_act    = NAN;
+static float d_boiler_set    = 55;  // SET (Dial -> StamPLC)
+
+// ---------- Pomocné ----------
+static inline bool isPlausibleTemp(float c) {
+  return isfinite(c) && (c > -100.0f) && (c < 300.0f);
+}
+
+// Konstanty řízení
+static float kotel_stop  = 50;
+static float kotel_start = 75;
+static float kotel_delta = 2;
+static float topeni_hyst = 2;
+static float kotel_abs_on  = 75.0f;  // >= → ON
+static float kotel_abs_off = 55.0f;  // <= → OFF
+
+// ---------- Výstupy ----------
+static inline void writeRelay12(uint8_t idx, bool on) { 
+  // idx: 0..3 (R1..R4 na PLC)
+  M5StamPLC.writePlcRelay(idx, on);
+  relay_state[idx] = on;
+}
+static inline void gpioR3_init() { pinMode(PORTA_G1_GPIO, OUTPUT); digitalWrite(PORTA_G1_GPIO, LOW); }
+static inline void gpioR3_write(bool on) { digitalWrite(PORTA_G1_GPIO, on ? HIGH : LOW); }
+
+// Sole electrical direction mapping; preserves old plus=true => warmer wiring.
+// VERIFY physically: relay HIGH must move toward OPEN_HOT on the installed servo.
+struct ValveOutputs {
+  void run(bool on) { writeRelay12(2, on); }
+  void direction(safety::Direction dir) {
+    writeRelay12(3, dir == safety::Direction::OPEN_HOT);
+  }
+} valve_outputs;
+
+// ---------- UI ----------
+static void drawUI() {
+  auto& d = M5StamPLC.Display;
+
+  d.startWrite();
+  d.fillScreen(TFT_BLACK);
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+  d.setTextDatum(textdatum_t::top_left);
+
+  // Pouze režim tří čerpadel a velká teplota kotle.
+  d.setTextSize(2);
+  d.setCursor(6, 3);
+  d.printf("KOTEL");
+  d.setCursor(138, 3);
+  d.printf("%s", pump_force_on[0] ? "FORCE ON" : "AUT");
+  d.setCursor(6, 27);
+  d.printf("TOPENI");
+  d.setCursor(138, 27);
+  d.printf("%s", pump_force_on[1] ? "FORCE ON" : "AUT");
+  d.setCursor(6, 51);
+  d.printf("BOILER");
+  d.setCursor(138, 51);
+  d.printf("%s", pump_force_on[2] ? "FORCE ON" : "AUT");
+
+  d.setTextSize(4);
+  d.setCursor(42, 91);
+  if (isPlausibleTemp(t_nt_kotel)) d.printf("%5.1f C", t_nt_kotel);
+  else                             d.printf("  --.- C");
+  d.endWrite();
+}
+
+static void serviceLocalUI() {
+  if (valve.busy()) return;
+  M5.update();
+  bool changed = false;
+  if (M5.BtnA.wasClicked()) {
+    pump_force_on[0] = !pump_force_on[0];
+    changed = true;
+  }
+  if (M5.BtnB.wasClicked()) {
+    pump_force_on[1] = !pump_force_on[1];
+    changed = true;
+  }
+  if (M5.BtnC.wasClicked()) {
+    pump_force_on[2] = !pump_force_on[2];
+    changed = true;
+  }
+  static uint32_t last_ui_ms = 0;
+  if (changed || safety::expired(millis(), last_ui_ms, 1000)) {
+    last_ui_ms = millis();
+    drawUI();
+  }
+}
+
+// ---------- ČTENÍ NT48A08: Holding 0..7, /10 ----------
+static bool readNT48() {
+  uint16_t raw[8];
+  const auto result = safety::readRegisters(ModbusRTUClient, NT48_ID, HOLDING_REGISTERS, 0, raw);
+  if (result != safety::FrameResult::OK) {
+    Serial.println(result == safety::FrameResult::FAIL ? "[NT48] FAIL/timeout/frame error" : "[NT48] PARTIAL");
+    return false; // Keep historical values; their freshness expires independently.
+  }
+  nt48_freshness.success(millis());
+  nt48_ever_received = true;
+  pending_temp = 0;
+
+  auto f = [](int16_t v)->float{
+    float x = v / 10.0f;
+    if (!isPlausibleTemp(x) || fabsf(x + 273.1f) < 0.05f) return NAN;
+    return x;
+  };
+
+  t_nt_tank_top  = f(static_cast<int16_t>(raw[0]));
+  t_nt_tank_mid  = f(static_cast<int16_t>(raw[1]));
+  t_nt_tank_down = f(static_cast<int16_t>(raw[2]));
+  t_nt_kotel    = f(static_cast<int16_t>(raw[3]));
+  t_nt_boiler    = f(static_cast<int16_t>(raw[4]));
+  t_nt_topeni     = f(static_cast<int16_t>(raw[5]));
+
+  Serial.println(F("--- NT48 (ID=2): temps (/10) ---"));
+  Serial.printf("tank_top/mid/down: %.1f / %.1f / %.1f\n", t_nt_tank_top, t_nt_tank_mid, t_nt_tank_down);
+  Serial.printf("topeni/boiler/kotel: %.1f / %.1f / %.1f\n", t_nt_topeni, t_nt_boiler, t_nt_kotel);
+  return true;
+}
+
+// ---------- NT48 → Dial (HR = INT °C) ----------
+static inline int16_t round_to_i16(float c) {
+  long v = lroundf(c);                   // na celé °C
+  if (v >  32767) v =  32767;
+  if (v < -32768) v = -32768;
+  return (int16_t)v;
+}
+
+static bool pushTempsToDial() {
+  // pošleme naměřené teploty z NT48 do Dial HR jako INT °C (žádné ×10)
+  struct { uint16_t addr; float val; const char* name; } wr[] = {
+    { HR_KOTEL_TEMP,  t_nt_kotel,     "HR_KOTEL_TEMP"  },
+    { HR_TANK_TOP,    t_nt_tank_top,  "HR_TANK_TOP"    },
+    { HR_TANK_MID,    t_nt_tank_mid,  "HR_TANK_MID"    },
+    { HR_TANK_DOWN,   t_nt_tank_down, "HR_TANK_DOWN"   },
+    { HR_TOPENI_ACT,  t_nt_topeni,    "HR_TOPENI_ACT"  },
+    { HR_BOILER_ACT,  t_nt_boiler,    "HR_BOILER_ACT"  },
+    { HR_KOTEL_TEMP2, t_nt_kotel,     "HR_KOTEL_TEMP2" },
+  };
+
+  while (pending_temp < 7) {
+    const auto& w = wr[pending_temp++];
+    if (!isPlausibleTemp(w.val)) continue;
+    const int16_t v = round_to_i16(w.val);
+    if (!ModbusRTUClient.holdingRegisterWrite(DIAL_ID, w.addr, (uint16_t)v)) {
+      Serial.printf("[DIAL] FAIL write %s @%u\n", w.name, w.addr);
+      display_link.failed(millis());
+      pending_temp = 7;
+    }
+    return true; // Only ONE synchronous transaction before returning to safety control.
+  }
+  return false;
+}
+
+// ---------- ČTENÍ DIAL: HR (INT °C) ----------
+static inline float hrToC(uint16_t w) {
+  // Dial ukládá HR jako INT °C → jen přecast na float pro tisk/UI
+  return (float)((int16_t)w);
+}
+
+static bool readDial_Holding() {
+  uint16_t hr[8];
+  const auto result = safety::readRegisters(ModbusRTUClient, DIAL_ID, HOLDING_REGISTERS, HR_KOTEL_TEMP, hr);
+  if (result != safety::FrameResult::OK) {
+    Serial.println(result == safety::FrameResult::FAIL ? "[DIAL] FAIL/timeout/frame error" : "[DIAL] PARTIAL");
+    display_link.completeRead(millis(), false);
+    return false;
+  }
+
+  display_link.completeRead(millis(), true);
+  d_kotel_temp = hrToC(hr[0]);
+  d_tank_top   = hrToC(hr[1]);
+  d_tank_mid   = hrToC(hr[2]);
+  d_tank_down  = hrToC(hr[3]);
+  d_topeni_act = hrToC(hr[4]);
+  if (!safety::acceptSetpoint(hrToC(hr[5]), 35, 70, d_topeni_set))
+    Serial.println("[DIAL] rejected heating setpoint");
+  d_boiler_act = hrToC(hr[6]);
+  if (!safety::acceptSetpoint(hrToC(hr[7]), 50, 65, d_boiler_set))
+    Serial.println("[DIAL] rejected boiler setpoint");
+
+  Serial.println(F("--- DIAL (ID=1): HR INT °C ---"));
+  Serial.printf("kotel: %.0f C | tank T/M/D: %.0f / %.0f / %.0f C\n",
+                d_kotel_temp, d_tank_top, d_tank_mid, d_tank_down);
+  Serial.printf("topeni ACT/SET: %.0f / %.0f C | boiler ACT/SET: %.0f / %.0f C\n",
+                d_topeni_act, d_topeni_set, d_boiler_act, d_boiler_set);
+  return true;
+}
+
+// ---------- ZÁPIS COILŮ NA DIAL (pouze signalizace!) ----------
+static bool writeDial_Coil(uint16_t addr, bool on) {
+  if (!ModbusRTUClient.coilWrite(DIAL_ID, addr, on ? 0xFF : 0x00)) {
+    Serial.printf("[DIAL] coilWrite addr %u FAIL\n", addr);
+    display_link.failed(millis());
+    return false;
+  }
+  return true;
+}
+static bool signalPumpsToDial(bool kotel_on, bool topeni_on, bool boiler_on) {
+  if (valve.busy()) return false; // No blocking Modbus while a pulse/deadtime is active.
+  static bool sent[3] = {};
+  static bool known[3] = {};
+  static bool attempted[3] = {};
+  static uint32_t last_attempt[3] = {};
+  static uint32_t last_ok[3] = {};
+  const bool desired[3] = {kotel_on, topeni_on, boiler_on};
+  const uint32_t now = millis();
+  for (uint16_t i = 0; i < 3; ++i) {
+    const bool due = !known[i] || sent[i] != desired[i] || safety::expired(now, last_ok[i], 10000);
+    if (!due || (attempted[i] && !safety::expired(now, last_attempt[i], 1000))) continue;
+    attempted[i] = true;
+    last_attempt[i] = now;
+    if (writeDial_Coil(i, desired[i])) {
+      known[i] = true;
+      sent[i] = desired[i];
+      last_ok[i] = millis();
+    } else {
+      known[i] = false; // Retry failed writes even if desired state returns to old value.
+    }
+    return true; // At most one transaction per loop; retries limited to 1 s per coil.
+  }
+  return false;
+}
+
+// Display is last priority. All paths share backoff, including temperature/coils.
+// Offline: read-only probe every 10 s; only a complete read restores ONLINE.
+static bool serviceDisplay(bool kotel_on, bool topeni_on, bool boiler_on) {
+  if (!modbus_ready || valve.busy() || (valve.emergency_latched &&
+      valve.state != safety::Valve::State::EMERGENCY_HOLD)) return false;
+  const uint32_t now = millis();
+  if (!nt48_poll_started || safety::expired(now, lastPollNT48, POLL_NT48_MS)) return false;
+  if (display_link.due(now)) { readDial_Holding(); return true; }
+  if (display_link.offline) return false;
+  if (signalPumpsToDial(kotel_on, topeni_on, boiler_on)) return true;
+  if (nt48_freshness.current(millis())) return pushTempsToDial();
+  return false;
+}
+
+static bool tryInitModbus(uint32_t now) {
+  last_modbus_init_attempt_ms = now;
+  modbus_ready = ModbusRTUClient.begin(MODBUS_BAUD, SERIAL_8N1);
+  if (modbus_ready) {
+    nt48_poll_started = false; // Acquisition, not begin(), determines sensor health.
+    Serial.println(F("[MODBUS] initialized"));
+  } else {
+    Serial.println(F("[MODBUS] init failed; safety mode active"));
+  }
+  return modbus_ready;
+}
+
+// ===================== SETUP / LOOP =====================
+void setup() {
+  Serial.begin(115200);
+  delay(150);
+
+  // M5 + PLC
+  auto cfg = M5.config();
+  M5.begin(cfg);
+  M5StamPLC.begin();
+  // First output write after relay hardware is available; never rely on RAM cache.
+  M5StamPLC.writePlcRelay(2, false);
+  relay_state[2] = false;
+
+  // Displej
+  M5StamPLC.Display.setRotation(1);
+  M5StamPLC.Display.setBrightness(200);
+
+  // PORTA G1 (čerpadlo boiler)
+  gpioR3_init();
+
+  nt48_started_ms = millis();
+  tryInitModbus(nt48_started_ms); // Failure must still enter loop and pump failsafe.
+  // First loop polls NT48 and applies control before any Display transaction.
+}
+
+void loop() {
+  uint32_t now = millis();
+
+  // 1. Service motor deadline before any potentially blocking operation.
+  valve.service(now, valve_outputs);
+
+  // Initialization may block too: pause the SAME emergency episode before retry.
+  if (!modbus_ready && safety::expired(now, last_modbus_init_attempt_ms, MODBUS_INIT_RETRY_MS)) {
+    if (valve.emergency_latched) valve.pauseEmergency(now, valve_outputs);
+    if (!valve.busy()) {
+      valve_outputs.run(false);
+      tryInitModbus(now);
+    }
+  }
+  now = millis();
+
+  // 2. NT48 has priority. Emergency motion pauses for the synchronous read;
+  // its single episode keeps the accumulated ON-time budget (no 1 s/15 s cycling).
+  if (modbus_ready && (!nt48_poll_started || safety::expired(now, lastPollNT48, POLL_NT48_MS))) {
+    if (valve.emergency_latched) valve.pauseEmergency(now, valve_outputs);
+    if (!valve.busy()) {
+      valve_outputs.run(false);
+      readNT48();
+      lastPollNT48 = millis();
+      nt48_poll_started = true;
+    }
+  }
+  now = millis();
+
+  // ====== AUTO ŘÍZENÍ – logika s hysterezí a failsafe ======
+
+  // 1) Validace měření (failsafe ON pokud něco chybí)
+  const bool fresh = modbus_ready && nt48_freshness.current(now);
+  bool valid_kotel   = isPlausibleTemp(t_nt_kotel);
+  bool valid_tankT   = isPlausibleTemp(t_nt_tank_top);
+  bool valid_tankM   = isPlausibleTemp(t_nt_tank_mid);
+  bool valid_topeni  = isPlausibleTemp(t_nt_topeni);
+  bool valid_boiler  = isPlausibleTemp(t_nt_boiler);
+
+  static bool kotel_on  = true;   // paměť pro hysterezi
+  static bool topeni_on = true;
+  static bool boiler_on = true;
+
+  bool any_invalid = !fresh || !(valid_kotel && valid_tankT && valid_tankM && valid_topeni && valid_boiler);
+
+  // 2) ALARM přehřátí (NT48 senzor!)
+  const bool was_alarm = overheat_active;
+  const bool tank_alarm_valid = fresh && valid_tankT;
+  overheat_active = safety::updateAlarm(overheat_active, tank_alarm_valid, t_nt_tank_top);
+  const bool alarm = overheat_active;
+  const bool heat_dump_feedback_valid = fresh && valid_tankT && valid_topeni;
+  if (alarm && !was_alarm && !valve.emergency_latched) valve.stop(now, valve_outputs);
+  sensor_mode = !fresh ? SensorMode::NT48_LOST :
+                any_invalid ? SensorMode::SENSOR_FAIL : SensorMode::NORMAL;
+  // At boot, allow the same 12 s acquisition window before blind emergency motion.
+  const bool long_communication_loss = !fresh && (nt48_ever_received ||
+    safety::expired(now, nt48_started_ms, safety::NT48_STALE_TIMEOUT_MS));
+  const bool complete_sensor_loss = long_communication_loss || (fresh &&
+    !(valid_kotel || valid_tankT || valid_tankM || valid_topeni || valid_boiler));
+
+  // A. Confirmed overheat with usable supply feedback outranks unrelated faults.
+  if (alarm && heat_dump_feedback_valid) {
+    kotel_on = topeni_on = boiler_on = true;
+    if (valve.emergency_latched) valve.recover(now, valve_outputs);
+    if (!valve.busy()) {
+      writeRelay12(0, !kotel_on);
+      writeRelay12(1, !topeni_on);
+    }
+    gpioR3_write(boiler_on);
+    const auto wanted = safety::demand(true, t_nt_topeni,
+                                      safety::ALARM_DUMP_SUPPLY_SETPOINT, topeni_hyst);
+    valve.update(millis(), wanted, valve_outputs);
+    if (!valve.busy()) valve_outputs.run(false);
+    serviceLocalUI();
+    serviceDisplay(kotel_on, topeni_on, boiler_on);
+    delay(5);
+    return;
+  }
+
+  // 3. Control/fault actions before Display. Individual sensor errors retain STOP;
+  // complete loss starts a single bounded emergency travel, only rearmed by full recovery.
+  if (any_invalid) {
+    kotel_on = topeni_on = boiler_on = true;
+    if (!valve.busy()) {
+      writeRelay12(0, !kotel_on);
+      writeRelay12(1, !topeni_on);
+    }
+    gpioR3_write(boiler_on);
+    if (complete_sensor_loss) {
+      if (!valve.emergency_latched) {
+        valve.stop(now, valve_outputs);
+        writeRelay12(0, !kotel_on);
+        writeRelay12(1, !topeni_on);
+        valve.startEmergencyTravel(millis(), valve_outputs);
+      }
+      valve.updateEmergency(millis(), valve_outputs);
+    } else {
+      if (valve.emergency_latched) valve.holdEmergency(now, valve_outputs);
+      else valve.stop(now, valve_outputs);
+      writeRelay12(0, !kotel_on);
+      writeRelay12(1, !topeni_on);
+    }
+    if (!valve.busy()) valve_outputs.run(false);
+    serviceLocalUI();
+    serviceDisplay(kotel_on, topeni_on, boiler_on);
+    delay(5);
+    return;
+  }
+  if (valve.emergency_latched) valve.recover(now, valve_outputs);
+
+  // 4) KOTEL (primární okruh) – absolutní prahy + původní hystereze
+
+  // Tvrdé prahy mají prioritu
+  if (t_nt_kotel >= kotel_abs_on) {
+    kotel_on = true;
+  } else if (t_nt_kotel <= kotel_abs_off) {
+    kotel_on = false;
+  } else {
+    // V pásmu 55–75 °C platí původní logika s hysterezí a delta vůči nádrži
+    if (!kotel_on) {
+      // OFF -> ON: kotel dost teplý a teplejší než horní část nádrže o kotel_delta
+      if ((t_nt_kotel >= kotel_start) && (t_nt_kotel >= t_nt_tank_top + kotel_delta)) {
+        kotel_on = true;
+      }
+    } else {
+      // ON -> OFF: kotel vychladl pod stop nebo je chladnější než nádrž
+      if ((t_nt_kotel <= kotel_stop) || (t_nt_kotel <= t_nt_tank_top - kotel_delta)) {
+        kotel_on = false;
+      }
+    }
+  }
+
+  // 5) TOPENÍ (radiátory) – hystereze na horní části nádrže
+  if (!topeni_on) {
+    if (t_nt_tank_top > (d_topeni_set + topeni_hyst)) {
+      topeni_on = true;
+    }
+  } else {
+    if (t_nt_tank_top < (d_topeni_set - topeni_hyst)) {
+      topeni_on = false;
+    }
+  }
+
+  // 6) BOILER (TUV) – hystereze a zdroj tepla z nádrže (střed)
+  if (!boiler_on) {
+    if ((t_nt_boiler < (d_boiler_set - topeni_hyst)) && (t_nt_tank_mid > t_nt_boiler)) {
+      boiler_on = true;
+    }
+  } else {
+    if ((t_nt_boiler >= (d_boiler_set + topeni_hyst)) || (t_nt_tank_mid <= t_nt_boiler)) {
+      boiler_on = false;
+    }
+  }
+
+  // Ruční volba je pouze FORCE ON; další stisk vrátí dané čerpadlo do AUT.
+  // Bezpečnostní větve výše zůstávají nadřazené a při poruše čerpadla zapínají.
+  if (pump_force_on[0]) kotel_on = true;
+  if (pump_force_on[1]) topeni_on = true;
+  if (pump_force_on[2]) boiler_on = true;
+
+  const auto wanted = safety::demand(topeni_on, t_nt_topeni, d_topeni_set, topeni_hyst);
+
+  // 9) Zápis výstupů (NC mapování pro KOTEL/TOPENI)
+  if (!valve.busy()) { // Avoid repeated I2C writes during the timed movement.
+    writeRelay12(0, !kotel_on);   // R1 KOTEL (NC)
+    writeRelay12(1, !topeni_on);  // R2 TOPENI (NC)
+  }
+  gpioR3_write(boiler_on);      // PORTA G1 (Boiler pump)
+
+  // Actuator decision FIRST; busy() gates local UI and synchronous Display I/O.
+  valve.update(millis(), wanted, valve_outputs);
+  if (!valve.busy()) valve_outputs.run(false);
+  serviceLocalUI();
+  serviceDisplay(kotel_on, topeni_on, boiler_on);
+  delay(5);
+}

@@ -1,0 +1,8 @@
+PASS emergency rollover, single travel + hour HOLD, polling pause budget, recovery, Display backoff rollover
+PASS timer rollover, remaining, periodic; valve direction/order/pulse/settling; frames, freshness, setpoints
+PASS 10-minute alarm: 37 pulses, longest continuous RUN 1000 ms
+PASS real setup/loop: boot, partial/fail/stale, pump failsafe, recovery, invalid setpoints, alarm exit
+PASS real loop 15-minute alarm, both directions, offline Display, rollover: max actual RUN 1000 ms (36 opening pulses in first 10 min)
+PASS A-H: preserved HIGH/LOW direction, independent tank alarm, hour fault: one 120000 ms emergency budget, HOLD, recovery
+PASS offline Display: 10 min + rollover, no stale NT48, max initial poll gap <6000 ms, complete-frame recovery, last SET retained
+PASS boot loss: 12 s grace, recovery; fresh frame with all sensors invalid enters emergency

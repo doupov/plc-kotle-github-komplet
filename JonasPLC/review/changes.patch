@@ -1,0 +1,871 @@
+--- a/JonasPLC/src/main.cpp
++++ b/JonasPLC/src/main.cpp
+@@ -7,6 +7,11 @@
+ #include <ArduinoModbus.h>
+ #include <ArduinoRS485.h>
+ #include <cmath>
++#include "control_safety.h"
++
++static safety::Freshness nt48_freshness;
++static safety::Valve valve;
++static bool overheat_active = false;
+ 
+ // StamPLC zapojení RS485 transceiveru (DE/RE/TXEN)
+ RS485Class RS485(Serial2, 39, 0, 46, -1);
+@@ -59,9 +64,10 @@
+ static float d_tank_mid      = NAN;
+ static float d_tank_down     = NAN;
+ static float d_topeni_act    = NAN;
+-static float d_topeni_set    = NAN;  // SET (Dial -> StamPLC)
++// BEHAVIOR CHANGE: bounded Display defaults until the first valid panel read.
++static float d_topeni_set    = 60;  // SET (Dial -> StamPLC)
+ static float d_boiler_act    = NAN;
+-static float d_boiler_set    = NAN;  // SET (Dial -> StamPLC)
++static float d_boiler_set    = 55;  // SET (Dial -> StamPLC)
+ 
+ // ---------- Pomocné ----------
+ static inline bool isPlausibleTemp(float c) {
+@@ -73,7 +79,6 @@
+ static float kotel_start = 75;
+ static float kotel_delta = 2;
+ static float topeni_hyst = 2;
+-static float alarmtemp   = 85;
+ static float kotel_abs_on  = 75.0f;  // >= → ON
+ static float kotel_abs_off = 55.0f;  // <= → OFF
+ 
+@@ -85,6 +90,15 @@
+ }
+ static inline void gpioR3_init() { pinMode(PORTA_G1_GPIO, OUTPUT); digitalWrite(PORTA_G1_GPIO, LOW); }
+ static inline void gpioR3_write(bool on) { digitalWrite(PORTA_G1_GPIO, on ? HIGH : LOW); }
++
++// Sole electrical direction mapping; preserves old plus=true => warmer wiring.
++// VERIFY physically: relay HIGH must move toward OPEN_HOT on the installed servo.
++struct ValveOutputs {
++  void run(bool on) { writeRelay12(2, on); }
++  void direction(safety::Direction dir) {
++    writeRelay12(3, dir == safety::Direction::OPEN_HOT);
++  }
++} valve_outputs;
+ 
+ // ---------- UI ----------
+ static void drawUI() {
+@@ -105,7 +119,7 @@
+            relay_state[0] ? "ON" : "OFF",
+            relay_state[1] ? "ON" : "OFF",
+            relay_state[2] ? "ON" : "OFF",
+-           relay_state[3] ? "PLUS" : "MINUS");
++           relay_state[3] ? "OPEN_HOT*" : "CLOSE_HOT*");
+ 
+   d.setCursor(8, 40);
+   d.printf("PORTA G1 (boiler pump): %s\n", (digitalRead(PORTA_G1_GPIO) ? "ON" : "OFF"));
+@@ -128,18 +142,20 @@
+   d.printf("DIAL  boiler: act %.0f  set %.0f C\n",  d_boiler_act, d_boiler_set);
+ 
+   d.setCursor(8, 130);
+-  d.println("Coils on DIAL now only mirror pump states (signal only).");
++  d.printf("NT48: %s | alarm: %s", nt48_freshness.current(millis()) ? "FRESH" : "STALE",
++           overheat_active ? "ON" : "OFF");
+   d.endWrite();
+ }
+ 
+ // ---------- ČTENÍ NT48A08: Holding 0..7, /10 ----------
+ static bool readNT48() {
+-  if (!ModbusRTUClient.requestFrom(NT48_ID, HOLDING_REGISTERS, 0x0000, 8)) {
+-    Serial.println(F("[NT48] FAIL: Holding 0..7"));
+-    return false;
+-  }
+-  int16_t raw[8] = {0};
+-  for (int i = 0; i < 8 && ModbusRTUClient.available(); ++i) raw[i] = (int16_t)ModbusRTUClient.read();
++  uint16_t raw[8];
++  const auto result = safety::readRegisters(ModbusRTUClient, NT48_ID, HOLDING_REGISTERS, 0, raw);
++  if (result != safety::FrameResult::OK) {
++    Serial.println(result == safety::FrameResult::FAIL ? "[NT48] FAIL/timeout/frame error" : "[NT48] PARTIAL");
++    return false; // Keep historical values; their freshness expires independently.
++  }
++  nt48_freshness.success(millis());
+ 
+   auto f = [](int16_t v)->float{
+     float x = v / 10.0f;
+@@ -147,12 +163,12 @@
+     return x;
+   };
+ 
+-  t_nt_tank_top  = f(raw[0]);
+-  t_nt_tank_mid  = f(raw[1]);
+-  t_nt_tank_down = f(raw[2]);
+-  t_nt_kotel    = f(raw[3]);
+-  t_nt_boiler    = f(raw[4]);
+-  t_nt_topeni     = f(raw[5]);
++  t_nt_tank_top  = f(static_cast<int16_t>(raw[0]));
++  t_nt_tank_mid  = f(static_cast<int16_t>(raw[1]));
++  t_nt_tank_down = f(static_cast<int16_t>(raw[2]));
++  t_nt_kotel    = f(static_cast<int16_t>(raw[3]));
++  t_nt_boiler    = f(static_cast<int16_t>(raw[4]));
++  t_nt_topeni     = f(static_cast<int16_t>(raw[5]));
+ 
+   Serial.println(F("--- NT48 (ID=2): temps (/10) ---"));
+   Serial.printf("tank_top/mid/down: %.1f / %.1f / %.1f\n", t_nt_tank_top, t_nt_tank_mid, t_nt_tank_down);
+@@ -188,6 +204,7 @@
+     int16_t v = round_to_i16(w.val);           // INT °C
+     if (!ModbusRTUClient.holdingRegisterWrite(DIAL_ID, w.addr, (uint16_t)v)) {
+       Serial.printf("[DIAL] FAIL write %s @%u\n", w.name, w.addr);
++      break; // Offline panel: do not wait for seven consecutive timeouts.
+     } else {
+       Serial.printf("[DIAL] write %s = %d (INT °C)\n", w.name, v);
+     }
+@@ -201,21 +218,23 @@
+ }
+ 
+ static bool readDial_Holding() {
+-  if (!ModbusRTUClient.requestFrom(DIAL_ID, HOLDING_REGISTERS, HR_KOTEL_TEMP, 8)) {
+-    Serial.println(F("[DIAL] FAIL: Holding"));
++  uint16_t hr[8];
++  const auto result = safety::readRegisters(ModbusRTUClient, DIAL_ID, HOLDING_REGISTERS, HR_KOTEL_TEMP, hr);
++  if (result != safety::FrameResult::OK) {
++    Serial.println(result == safety::FrameResult::FAIL ? "[DIAL] FAIL/timeout/frame error" : "[DIAL] PARTIAL");
+     return false;
+   }
+-  uint16_t hr[8] = {0};
+-  for (int i = 0; i < 8 && ModbusRTUClient.available(); ++i) hr[i] = ModbusRTUClient.read();
+ 
+   d_kotel_temp = hrToC(hr[0]);
+   d_tank_top   = hrToC(hr[1]);
+   d_tank_mid   = hrToC(hr[2]);
+   d_tank_down  = hrToC(hr[3]);
+   d_topeni_act = hrToC(hr[4]);
+-  d_topeni_set = hrToC(hr[5]);  // SET (INT °C)
++  if (!safety::acceptSetpoint(hrToC(hr[5]), 35, 70, d_topeni_set))
++    Serial.println("[DIAL] rejected heating setpoint");
+   d_boiler_act = hrToC(hr[6]);
+-  d_boiler_set = hrToC(hr[7]);  // SET (INT °C)
++  if (!safety::acceptSetpoint(hrToC(hr[7]), 50, 65, d_boiler_set))
++    Serial.println("[DIAL] rejected boiler setpoint");
+ 
+   Serial.println(F("--- DIAL (ID=1): HR INT °C ---"));
+   Serial.printf("kotel: %.0f C | tank T/M/D: %.0f / %.0f / %.0f C\n",
+@@ -234,9 +253,28 @@
+   return true;
+ }
+ static void signalPumpsToDial(bool kotel_on, bool topeni_on, bool boiler_on) {
+-  writeDial_Coil(CO_KOTEL_PUMP,  kotel_on);
+-  writeDial_Coil(CO_TOPENI_PUMP, topeni_on);
+-  writeDial_Coil(CO_BOILER_PUMP, boiler_on);
++  if (valve.busy()) return; // No blocking Modbus while a pulse/deadtime is active.
++  static bool sent[3] = {};
++  static bool known[3] = {};
++  static bool attempted[3] = {};
++  static uint32_t last_attempt[3] = {};
++  static uint32_t last_ok[3] = {};
++  const bool desired[3] = {kotel_on, topeni_on, boiler_on};
++  const uint32_t now = millis();
++  for (uint16_t i = 0; i < 3; ++i) {
++    const bool due = !known[i] || sent[i] != desired[i] || safety::expired(now, last_ok[i], 10000);
++    if (!due || (attempted[i] && !safety::expired(now, last_attempt[i], 1000))) continue;
++    attempted[i] = true;
++    last_attempt[i] = now;
++    if (writeDial_Coil(i, desired[i])) {
++      known[i] = true;
++      sent[i] = desired[i];
++      last_ok[i] = millis();
++    } else {
++      known[i] = false; // Retry failed writes even if desired state returns to old value.
++    }
++    break; // At most one transaction per loop; retries limited to 1 s per coil.
++  }
+ }
+ 
+ // ===================== SETUP / LOOP =====================
+@@ -248,6 +286,9 @@
+   auto cfg = M5.config();
+   M5.begin(cfg);
+   M5StamPLC.begin();
++  // First output write after relay hardware is available; never rely on RAM cache.
++  M5StamPLC.writePlcRelay(2, false);
++  relay_state[2] = false;
+ 
+   // Displej
+   M5StamPLC.Display.setRotation(1);
+@@ -278,29 +319,34 @@
+ const uint32_t POLL_DIAL_MS = 1000;  // 1 s
+ 
+ void loop() {
+-  M5.update();
+   uint32_t now = millis();
+ 
+-  // Periodické čtení NT48 a PUSH do Dialu (HR = INT °C)
+-  if (now - lastPollNT48 >= POLL_NT48_MS) {
+-    lastPollNT48 = now;
+-    if (readNT48()) {
+-      pushTempsToDial();  // NT48 -> Dial HR (INT)
+-      drawUI();
+-    }
+-  }
+-
+-  // Periodické čtení Dial (HR) – kvůli setpointům
+-  if (now - lastPollDial >= POLL_DIAL_MS) {
+-    lastPollDial = now;
+-    if (readDial_Holding()) {
+-      drawUI();
+-    }
+-  }
++  // Keep pulse servicing free of synchronous Modbus, UI and M5 operations.
++  if (!valve.busy()) {
++    valve_outputs.run(false); // Reassert STOP; relay API has no write-success result.
++    M5.update();
++
++    // Periodické čtení NT48 a PUSH do Dialu (HR = INT °C)
++    if (now - lastPollNT48 >= POLL_NT48_MS) {
++      lastPollNT48 = now;
++      if (readNT48()) {
++        pushTempsToDial();  // NT48 -> Dial HR (INT)
++      }
++    }
++
++    // Periodické čtení Dial (HR) – kvůli setpointům
++    if (now - lastPollDial >= POLL_DIAL_MS) {
++      lastPollDial = now;
++      readDial_Holding();
++    }
++
++  } // communication only while RUN is OFF
++  now = millis(); // Transactions may have consumed time; freshness uses completion time.
+ 
+   // ====== AUTO ŘÍZENÍ – logika s hysterezí a failsafe ======
+ 
+   // 1) Validace měření (failsafe ON pokud něco chybí)
++  const bool fresh = nt48_freshness.current(now);
+   bool valid_kotel   = isPlausibleTemp(t_nt_kotel);
+   bool valid_tankT   = isPlausibleTemp(t_nt_tank_top);
+   bool valid_tankM   = isPlausibleTemp(t_nt_tank_mid);
+@@ -311,24 +357,30 @@
+   static bool topeni_on = true;
+   static bool boiler_on = true;
+ 
+-  bool any_invalid = !(valid_kotel && valid_tankT && valid_tankM && valid_topeni && valid_boiler);
++  bool any_invalid = !fresh || !(valid_kotel && valid_tankT && valid_tankM && valid_topeni && valid_boiler);
+ 
+   // 2) ALARM přehřátí (NT48 senzor!)
+-  bool alarm = (!any_invalid) && (t_nt_tank_top > alarmtemp);
++  const bool was_alarm = overheat_active;
++  overheat_active = safety::updateAlarm(overheat_active, !any_invalid, t_nt_tank_top);
++  const bool alarm = overheat_active;
++  if (alarm && !was_alarm) valve.stop(now, valve_outputs);
++  // Refresh diagnostics even when BOTH devices are offline, only with motor stopped.
++  static uint32_t last_ui_ms = 0;
++  if (!valve.busy() && safety::expired(now, last_ui_ms, 1000)) {
++    last_ui_ms = now;
++    drawUI();
++  }
+ 
+   // 3) Failsafe větev
+   if (any_invalid) {
+     kotel_on  = true;
+     topeni_on = true;
+     boiler_on = true;
+-    bool ventil_run  = false;
+-    bool ventil_plus = false;
++    valve.stop(now, valve_outputs);
+ 
+     // Zápis výstupů (NC mapování zachováno)
+     writeRelay12(0, !kotel_on);   // R1 KOTEL (NC)
+     writeRelay12(1, !topeni_on);  // R2 TOPENI (NC)
+-    writeRelay12(2, ventil_run);  // R3 NO (run)
+-    writeRelay12(3, ventil_plus); // R4 COM (dir)
+     gpioR3_write(boiler_on);      // PORTA G1 (Boiler pump)
+ 
+     // Signalizace pump do DIAL (coils)
+@@ -346,7 +398,7 @@
+   } else if (t_nt_kotel <= kotel_abs_off) {
+     kotel_on = false;
+   } else {
+-    // V pásmu 55–80 °C platí původní logika s hysterezí a delta vůči nádrži
++    // V pásmu 55–75 °C platí původní logika s hysterezí a delta vůči nádrži
+     if (!kotel_on) {
+       // OFF -> ON: kotel dost teplý a teplejší než horní část nádrže o kotel_delta
+       if ((t_nt_kotel >= kotel_start) && (t_nt_kotel >= t_nt_tank_top + kotel_delta)) {
+@@ -382,36 +434,23 @@
+     }
+   }
+ 
+-  // 7) Ventil (směšovač) pro topení
+-  bool ventil_run  = false;
+-  bool ventil_plus = false; // false = minus
+-  if (topeni_on) {
+-    if (t_nt_topeni > (d_topeni_set + topeni_hyst)) {
+-      ventil_run  = true;
+-      ventil_plus = false;  // přivřít teplou (−)
+-    } else if (t_nt_topeni < (d_topeni_set - topeni_hyst)) {
+-      ventil_run  = true;
+-      ventil_plus = true;   // přidat teplou (+)
+-    }
+-  }
+-
+-  // 8) ALARM override: všechna čerpadla ON, ventil do mínusu (chladit do radiátorů)
++  // 7/8) Alarm retains pump override, but regulates supply to an explicit target.
++  // BEHAVIOR CHANGE: hysteretic alarm + bounded heat-dump supply regulation.
+   if (alarm) {
+-    kotel_on    = true;
+-    topeni_on   = true;
+-    boiler_on   = true;
+-    ventil_run  = true;
+-    ventil_plus = false;
+-  }
+-
+-  //kotel_on    = true;
++    kotel_on = topeni_on = boiler_on = true;
++  }
++  const float valve_target = alarm ? safety::ALARM_DUMP_SUPPLY_SETPOINT : d_topeni_set;
++  const auto wanted = safety::demand(topeni_on, t_nt_topeni, valve_target, topeni_hyst);
+ 
+   // 9) Zápis výstupů (NC mapování pro KOTEL/TOPENI)
+-  writeRelay12(0, !kotel_on);   // R1 KOTEL (NC)
+-  writeRelay12(1, !topeni_on);  // R2 TOPENI (NC)
+-  writeRelay12(2, ventil_run);  // R3 NO
+-  writeRelay12(3, ventil_plus); // R4 COM
++  if (!valve.busy()) { // Avoid repeated I2C writes during the timed movement.
++    writeRelay12(0, !kotel_on);   // R1 KOTEL (NC)
++    writeRelay12(1, !topeni_on);  // R2 TOPENI (NC)
++  }
+   gpioR3_write(boiler_on);      // PORTA G1 (Boiler pump)
++
++  // Service after pump writes; no blocking work may follow a newly started pulse.
++  valve.update(millis(), wanted, valve_outputs);
+ 
+   // 10) Signalizace pump do DIAL (coils) – pouze informace
+   signalPumpsToDial(kotel_on, topeni_on, boiler_on);
+--- a/Display/src/main.cpp
++++ b/Display/src/main.cpp
+@@ -42,6 +42,7 @@
+ 
+ // --- GLOBÁLNÍ PRAH PŘEHŘÁTÍ (požadavek) ---
+ int  g_overheat_threshold = 85;
++static constexpr int OVERHEAT_EXIT_TEMP = 82; // Match PLC alarm hysteresis.
+ bool g_overheat_active    = false;  // vnitřní latch pro "rising-edge" detekci
+ 
+ // ====== Modbus mapování registrů ======
+@@ -106,8 +107,12 @@
+ #endif
+ 
+ // --------- EEPROM pomocné ----------
++static bool eeprom_ready = false;
++static int saved_topeni_set = -1;
++static int saved_boiler_set = -1;
+ static void eeprom_begin() {
+-  EEPROM.begin(EE_SIZE);
++  eeprom_ready = EEPROM.begin(EE_SIZE);
++  if (!eeprom_ready) Serial.println("EEPROM init failed; using RAM defaults");
+ }
+ static uint16_t ee_read_u16(int addr) {
+   uint16_t hi = EEPROM.read(addr);
+@@ -118,7 +123,12 @@
+   EEPROM.write(addr,     (uint8_t)(v >> 8));
+   EEPROM.write(addr + 1, (uint8_t)(v & 0xFF));
+ }
+-static void ee_commit() { EEPROM.commit(); }
++static bool ee_commit() {
++  if (!EEPROM.commit()) { Serial.println("EEPROM commit failed"); return false; }
++  saved_topeni_set = g_topeni_set;
++  saved_boiler_set = g_boiler_set;
++  return true;
++}
+ 
+ static inline int clamp_to_range(int v, int vmin, int vmax) {
+   if (v < vmin) return vmin;
+@@ -127,6 +137,7 @@
+ }
+ 
+ static void load_setpoints_from_eeprom() {
++  if (!eeprom_ready) return;
+   uint16_t magic = ee_read_u16(EE_ADDR_MAGIC);
+   if (magic == EE_MAGIC) {
+     uint16_t t = ee_read_u16(EE_ADDR_TOP_SET);
+@@ -134,6 +145,10 @@
+     // validace proti GLOBÁLNÍM limitům
+     if (t >= g_topeni_set_min && t <= g_topeni_set_max) g_topeni_set = (int)t;
+     if (b >= g_boiler_set_min && b <= g_boiler_set_max) g_boiler_set = (int)b;
++    if (t == g_topeni_set && b == g_boiler_set) {
++      saved_topeni_set = g_topeni_set;
++      saved_boiler_set = g_boiler_set;
++    } // Invalid data: defaults in RAM, repair on next genuine edit exit.
+   } else {
+     // poprvé: zapiš aktuální defaulty a magic
+     ee_write_u16(EE_ADDR_TOP_SET, (uint16_t)g_topeni_set);
+@@ -144,10 +159,21 @@
+ }
+ 
+ static void save_setpoints_to_eeprom() {
++  if (!eeprom_ready || (saved_topeni_set == g_topeni_set && saved_boiler_set == g_boiler_set)) return;
+   ee_write_u16(EE_ADDR_TOP_SET, (uint16_t)g_topeni_set);
+   ee_write_u16(EE_ADDR_BLR_SET, (uint16_t)g_boiler_set);
+   ee_write_u16(EE_ADDR_MAGIC,   EE_MAGIC);
+   ee_commit();
++}
++
++static void finish_edit() {
++  if (edit_target == EDIT_NONE) return;
++  edit_target = EDIT_NONE;
++  g_topeni_set = clamp_to_range(g_topeni_set, g_topeni_set_min, g_topeni_set_max);
++  g_boiler_set = clamp_to_range(g_boiler_set, g_boiler_set_min, g_boiler_set_max);
++  save_setpoints_to_eeprom();
++  mb.Hreg(HR_TOPENI_SET, g_topeni_set);
++  mb.Hreg(HR_BOILER_SET, g_boiler_set);
+ }
+ 
+ // --- pomocné funkce ---
+@@ -266,7 +292,7 @@
+ 
+   // Červený panel (overheat) při > g_overheat_threshold
+   if (is_valid(objects.obj0)) {
+-    if (g_tank_top > g_overheat_threshold) lv_obj_clear_flag(objects.obj0, LV_OBJ_FLAG_HIDDEN);
++    if (g_overheat_active) lv_obj_clear_flag(objects.obj0, LV_OBJ_FLAG_HIDDEN);
+     else                                   lv_obj_add_flag(objects.obj0,   LV_OBJ_FLAG_HIDDEN);
+   }
+ 
+@@ -327,19 +353,25 @@
+ 
+ // Stáhne změny z masteru (vč. tank_top) a vyhodnotí přehřátí
+ static inline void modbus_pull_into_globals_and_check_overheat() {
++  g_kotel_pump_on = mb.Coil(CO_KOTEL_PUMP);
++  g_topeni_pump_on = mb.Coil(CO_TOPENI_PUMP);
++  g_boiler_pump_on = mb.Coil(CO_BOILER_PUMP);
++
+   // Holding regs -> int proměnné (vyjma setpointů, které v editaci držíme lokálně)
+-  g_kotel_temp  = (int)mb.Hreg(HR_KOTEL_TEMP);
+-  int new_tank_top = (int)mb.Hreg(HR_TANK_TOP);
+-  g_tank_mid    = (int)mb.Hreg(HR_TANK_MID);
+-  g_tank_down   = (int)mb.Hreg(HR_TANK_DOWN);
+-  g_topeni_act  = (int)mb.Hreg(HR_TOPENI_ACT);
+-  g_boiler_act  = (int)mb.Hreg(HR_BOILER_ACT);
+-  g_kotel_temp2  = (int)mb.Hreg(HR_KOTEL_TEMP2);
++  g_kotel_temp  = (int16_t)mb.Hreg(HR_KOTEL_TEMP);
++  int new_tank_top = (int16_t)mb.Hreg(HR_TANK_TOP);
++  g_tank_mid    = (int16_t)mb.Hreg(HR_TANK_MID);
++  g_tank_down   = (int16_t)mb.Hreg(HR_TANK_DOWN);
++  g_topeni_act  = (int16_t)mb.Hreg(HR_TOPENI_ACT);
++  g_boiler_act  = (int16_t)mb.Hreg(HR_BOILER_ACT);
++  g_kotel_temp2  = (int16_t)mb.Hreg(HR_KOTEL_TEMP2);
+ 
+   // Detekce přehřátí (rising-edge): přepni na TANK screen při překročení prahu
+-  bool now_hot = (new_tank_top > g_overheat_threshold);
++  bool now_hot = g_overheat_active ? new_tank_top > OVERHEAT_EXIT_TEMP
++                                   : new_tank_top > g_overheat_threshold;
+   if (now_hot && !g_overheat_active) {
+     // došlo ke KŘÍŽENÍ PRAHU nahoru -> přepnout na Nádrž (index 1)
++    finish_edit(); // Avoid invisible editing after the alarm changes screens.
+     load_screen(1);
+   }
+   g_overheat_active = now_hot;   // latch
+@@ -356,22 +388,12 @@
+ static inline bool is_screen_boiler() { return current_screen == 3; }
+ 
+ static void toggle_edit_current_screen() {
+-  // pouze na obrazovkách Topení/Boiler
+-  if (is_screen_topeni()) {
+-    edit_target = (edit_target == EDIT_TOPENI_SET ? EDIT_NONE : EDIT_TOPENI_SET);
++  if (edit_target != EDIT_NONE) {
++    finish_edit();
++  } else if (is_screen_topeni()) {
++    edit_target = EDIT_TOPENI_SET;
+   } else if (is_screen_boiler()) {
+-    edit_target = (edit_target == EDIT_BOILER_SET ? EDIT_NONE : EDIT_BOILER_SET);
+-  } else {
+-    edit_target = EDIT_NONE; // na jiných stránkách nic needitujeme
+-  }
+-
+-  // při opuštění editace – uložit do EEPROM + Modbus
+-  if (edit_target == EDIT_NONE) {
+-    // zajisti limity před uložením
+-    g_topeni_set = clamp_to_range(g_topeni_set, g_topeni_set_min, g_topeni_set_max);
+-    g_boiler_set = clamp_to_range(g_boiler_set, g_boiler_set_min, g_boiler_set_max);
+-    save_setpoints_to_eeprom();
+-    modbus_push_setpoints();
++    edit_target = EDIT_BOILER_SET;
+   }
+ }
+ 
+@@ -451,7 +473,8 @@
+ 
+   if (encoder_ready) {
+     int32_t enc_now = M5Dial.Encoder.read();
+-    int32_t diff = enc_now - last_enc;
++    uint32_t diff = uint32_t(enc_now) - uint32_t(last_enc);
++    const int encoder_direction = diff < 0x80000000UL ? +1 : -1;
+ 
+     if (diff != 0) {
+       uint32_t t = millis();
+@@ -459,13 +482,13 @@
+       if (edit_target == EDIT_NONE) {
+         // --- Navigace mezi obrazovkami (jako dřív) ---
+         if (t - last_switch_ms > switch_deadtime_ms) {
+-          int dir = (diff > 0 ? +1 : -1);
++          int dir = encoder_direction;
+           load_screen(current_screen + dir);
+           last_switch_ms = t;
+         }
+       } else {
+         // --- Jsme v režimu editace: enkodér upravuje setpoint ---
+-        int step = (diff > 0 ? +1 : -1);
++        int step = encoder_direction;
+         if (edit_target == EDIT_TOPENI_SET) {
+           g_topeni_set += step;
+           g_topeni_set = clamp_to_range(g_topeni_set, g_topeni_set_min, g_topeni_set_max);
+--- /dev/null
++++ b/JonasPLC/include/control_safety.h
+@@ -0,0 +1,116 @@
++#pragma once
++#include <stdint.h>
++#include <math.h>
++
++namespace safety {
++inline uint32_t elapsed(uint32_t now, uint32_t start) { return uint32_t(now - start); }
++inline bool expired(uint32_t now, uint32_t start, uint32_t duration) {
++  return elapsed(now, start) >= duration;
++}
++inline uint32_t remaining(uint32_t now, uint32_t start, uint32_t duration) {
++  const uint32_t age = elapsed(now, start);
++  return age >= duration ? 0 : duration - age;
++}
++
++// Commissioning defaults, NOT derived from an identified actuator:
++// 1 s motion (about 1/120 stroke for a 120 s servo), then 15 s to observe response.
++// 250 ms for relay direction switching; verify relay/servo specifications on site.
++// Tune these constants to the actual full-travel time and hydraulic lag.
++constexpr uint32_t VALVE_PULSE_MS = 1000;
++constexpr uint32_t VALVE_SETTLE_MS = 15000;
++constexpr uint32_t VALVE_DIRECTION_DEADTIME_MS = 250;
++// Four nominal 3 s NT48 polls; also tolerates a failed Display transaction batch.
++constexpr uint32_t NT48_STALE_TIMEOUT_MS = 12000;
++constexpr float OVERHEAT_ENTER_TEMP = 85.0f; // Preserve original strict > 85 activation.
++constexpr float OVERHEAT_EXIT_TEMP = 82.0f;  // 3 C hysteresis; release at <= 82.
++// Same as the existing default heating target; verify suitability of the heat dump.
++constexpr float ALARM_DUMP_SUPPLY_SETPOINT = 60.0f;
++static_assert(VALVE_PULSE_MS > 0 && VALVE_PULSE_MS < 0x80000000UL, "pulse interval");
++static_assert(VALVE_SETTLE_MS > 0 && VALVE_SETTLE_MS < 0x80000000UL, "settle interval");
++static_assert(VALVE_DIRECTION_DEADTIME_MS > 0 && VALVE_DIRECTION_DEADTIME_MS < 0x80000000UL, "deadtime interval");
++static_assert(OVERHEAT_EXIT_TEMP < OVERHEAT_ENTER_TEMP, "alarm hysteresis");
++
++enum class Direction : uint8_t { STOP, OPEN_HOT, CLOSE_HOT };
++inline Direction demand(bool enabled, float actual, float target, float hyst) {
++  if (!enabled || !isfinite(actual) || !isfinite(target)) return Direction::STOP;
++  if (actual < target - hyst) return Direction::OPEN_HOT;
++  if (actual > target + hyst) return Direction::CLOSE_HOT;
++  return Direction::STOP;
++}
++
++// Sink exposes run(bool), direction(Direction). No electrical polarity in control.
++class Valve {
++public:
++  enum class State : uint8_t { IDLE, DEADTIME, PULSE, SETTLING };
++  State state = State::IDLE;
++  Direction direction = Direction::STOP;
++  uint32_t started = 0;
++  bool busy() const { return state == State::PULSE || state == State::DEADTIME; }
++  template<class Sink> void stop(uint32_t now, Sink& out) {
++    out.run(false);
++    if (state != State::SETTLING) started = now;
++    state = State::SETTLING;
++  }
++  template<class Sink> void update(uint32_t now, Direction wanted, Sink& out) {
++    if (state == State::PULSE) {
++      if (wanted != direction || expired(now, started, VALVE_PULSE_MS)) stop(now, out);
++      return;
++    }
++    if (state == State::SETTLING) {
++      if (!expired(now, started, VALVE_SETTLE_MS)) return;
++      state = State::IDLE;
++    }
++    if (state == State::DEADTIME) {
++      if (wanted != direction) { stop(now, out); return; }
++      if (expired(now, started, VALVE_DIRECTION_DEADTIME_MS)) {
++        started = now;
++        state = State::PULSE;
++        out.run(true);
++      }
++      return;
++    }
++    if (wanted == Direction::STOP) return;
++    out.run(false);                 // Always before DIR, even the first movement.
++    out.direction(wanted);
++    direction = wanted;
++    started = now;
++    state = State::DEADTIME;
++  }
++};
++
++struct Freshness {
++  bool valid = false;
++  uint32_t last_ok = 0;
++  void success(uint32_t now) { valid = true; last_ok = now; }
++  bool current(uint32_t now) {
++    // Latch expiry: a second millis wrap must never revive an old measurement.
++    if (valid && expired(now, last_ok, NT48_STALE_TIMEOUT_MS)) valid = false;
++    return valid;
++  }
++};
++inline bool updateAlarm(bool active, bool valid, float tank) {
++  if (!valid) return active; // Retain latch; failsafe has priority while data invalid.
++  return active ? tank > OVERHEAT_EXIT_TEMP : tank > OVERHEAT_ENTER_TEMP;
++}
++inline bool acceptSetpoint(float value, float lo, float hi, float& saved) {
++  if (!isfinite(value) || value < lo || value > hi) return false;
++  saved = value;
++  return true;
++}
++enum class FrameResult { OK, FAIL, PARTIAL };
++template<class Client> FrameResult readRegisters(Client& client, int id, int type,
++                                                int address, uint16_t (&dest)[8]) {
++  const int count = client.requestFrom(id, type, address, 8);
++  if (count <= 0) return FrameResult::FAIL;
++  if (count != 8 || client.available() != 8) return FrameResult::PARTIAL;
++  uint16_t staged[8];
++  for (int i = 0; i < 8; ++i) {
++    if (client.available() <= 0) return FrameResult::PARTIAL;
++    const long value = client.read();
++    if (value < 0 || value > 65535) return FrameResult::PARTIAL;
++    staged[i] = uint16_t(value);
++  }
++  for (int i = 0; i < 8; ++i) dest[i] = staged[i];
++  return FrameResult::OK;
++}
++} // namespace safety
+--- /dev/null
++++ b/JonasPLC/test/host/integration_test.cpp
+@@ -0,0 +1,45 @@
++#include "../../src/main.cpp"
++#include <cstdio>
++int main() {
++  setup(); assert(!hw_relay[2]);
++  assert(d_topeni_set == 60 && d_boiler_set == 55);
++  loop();
++  ModbusRTUClient.dial[5]=0; ModbusRTUClient.dial[7]=65535;
++  assert(readDial_Holding()); assert(d_topeni_set==60 && d_boiler_set==55);
++  ModbusRTUClient.dial_count=7; ModbusRTUClient.dial[5]=40;
++  assert(!readDial_Holding()); assert(d_topeni_set==60);
++  ModbusRTUClient.dial_count=0; assert(!readDial_Holding()); assert(d_topeni_set==60);
++  ModbusRTUClient.nt_count=7; float old=t_nt_tank_top;
++  assert(!readNT48()); assert(t_nt_tank_top==old);
++  ModbusRTUClient.nt_count=0; assert(!readNT48());
++  fake_now+=safety::NT48_STALE_TIMEOUT_MS; loop();
++  assert(!hw_relay[0] && !hw_relay[1] && gpio && !hw_relay[2]);
++  // Recovery and sustained overheat, including offline Display and millis rollover.
++  ModbusRTUClient.nt_count=8; ModbusRTUClient.nt[0]=900;
++  fake_now=0xffff0000UL;
++  const uint32_t begin=fake_now;
++  bool was_running=false; uint32_t run_start=0, longest=0; unsigned pulses=0;
++  while (uint32_t(fake_now-begin)<600000) {
++    loop();
++    const bool run=hw_relay[2];
++    if(run && !was_running) {run_start=fake_now; ++pulses;}
++    if(!run && was_running) {const uint32_t duration=fake_now-run_start; if(duration>longest)longest=duration;}
++    if(run) assert(uint32_t(fake_now-run_start)<=safety::VALVE_PULSE_MS);
++    was_running=run;
++  }
++  assert(overheat_active && pulses>20 && max_run_ms == safety::VALVE_PULSE_MS);
++  assert(!hw_relay[0] && !hw_relay[1] && gpio);
++  // Test opposite temperature error for another five minutes of alarm.
++  ModbusRTUClient.nt[5]=800;
++  const uint32_t hot_start=fake_now;
++  while (uint32_t(fake_now-hot_start)<300000) loop();
++  assert(!hw_relay[3] && max_run_ms == safety::VALVE_PULSE_MS);
++  // Wait for STOP before explicitly invoking synchronous read functions.
++  while(valve.busy()) loop();
++  ModbusRTUClient.dial_count=8; ModbusRTUClient.dial[5]=45; ModbusRTUClient.dial[7]=60;
++  assert(readDial_Holding()); assert(d_topeni_set==45 && d_boiler_set==60);
++  ModbusRTUClient.nt[0]=820;
++  fake_now+=3000; loop(); assert(!overheat_active);
++  printf("PASS real setup/loop: boot, partial/fail/stale, pump failsafe, recovery, invalid setpoints, alarm exit\n");
++  printf("PASS real loop 15-minute alarm, both directions, offline Display, rollover: max actual RUN %u ms (%u opening pulses in first 10 min)\n",max_run_ms,pulses);
++}
+--- /dev/null
++++ b/JonasPLC/test/host/run.sh
+@@ -0,0 +1,9 @@
++#!/usr/bin/env bash
++set -eu
++cd "$(dirname "$0")/../.."
++work=$(mktemp -d /tmp/jonas-safety-test.XXXXXX)
++trap 'rm -rf "$work"' EXIT
++c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude test/host/safety_test.cpp -o "$work/safety"
++"$work/safety"
++c++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined -Iinclude -Itest/host/stubs test/host/integration_test.cpp -o "$work/integration"
++"$work/integration"
+--- /dev/null
++++ b/JonasPLC/test/host/safety_test.cpp
+@@ -0,0 +1,80 @@
++#include "control_safety.h"
++#include <cassert>
++#include <cstdio>
++#include <vector>
++using namespace safety;
++struct Sink {
++  bool running = false;
++  Direction dir = Direction::STOP;
++  unsigned pulses = 0;
++  void run(bool value) { if (value) { assert(!running); ++pulses; } running = value; }
++  void direction(Direction value) { assert(!running); dir = value; }
++};
++struct Client {
++  int count = 8, available_count = 8, cut = 8, pos = 0;
++  uint16_t values[8] = {700,600,500,750,550,600,0,0};
++  int requestFrom(int,int,int,int) { pos = 0; return count; }
++  int available() { return pos >= cut ? 0 : available_count - pos; }
++  long read() { return values[pos++]; }
++};
++int main() {
++  const uint32_t start = 0xfffffff0UL;
++  assert(!expired(0xffffffffUL, start, 32));
++  assert(!expired(0, start, 32));
++  assert(remaining(0, start, 32) == 16);
++  assert(expired(0x10, start, 32));
++  assert(remaining(0x11, start, 32) == 0);
++  uint32_t last = start; int ticks = 0;
++  for (uint32_t i = 1; i <= 128; ++i) if (expired(start+i, last, 32)) { last = start+i; ++ticks; }
++  assert(ticks == 4);
++  assert(demand(true, 50, 60, 2) == Direction::OPEN_HOT);
++  assert(demand(true, 70, 60, 2) == Direction::CLOSE_HOT);
++  for (float t : {58.f, 60.f, 62.f}) assert(demand(true,t,60,2) == Direction::STOP);
++  assert(demand(false,50,60,2) == Direction::STOP);
++  assert(demand(true,NAN,60,2) == Direction::STOP);
++  Valve v; Sink out;
++  v.update(start, Direction::OPEN_HOT, out); assert(!out.running);
++  v.update(start+249, Direction::OPEN_HOT, out); assert(!out.running);
++  v.update(start+250, Direction::OPEN_HOT, out); assert(out.running);
++  v.update(start+1249, Direction::OPEN_HOT, out); assert(out.running);
++  v.update(start+1250, Direction::OPEN_HOT, out); assert(!out.running);
++  v.update(start+16249, Direction::CLOSE_HOT, out); assert(out.dir == Direction::OPEN_HOT);
++  v.update(start+16250, Direction::CLOSE_HOT, out); assert(!out.running && out.dir == Direction::CLOSE_HOT);
++  v.update(start+16500, Direction::CLOSE_HOT, out); assert(out.running);
++  v.update(start+16501, Direction::OPEN_HOT, out); assert(!out.running && out.dir == Direction::CLOSE_HOT);
++  // Alarm edge interrupts an existing pulse, then remains hot for ten minutes.
++  v = Valve{}; out = Sink{};
++  v.update(0, Direction::CLOSE_HOT, out); v.update(250, Direction::CLOSE_HOT, out);
++  v.stop(300, out); assert(!out.running);
++  bool alarm = false, prev = false; uint32_t on_since = 0, max_run = 0;
++  for (uint32_t now = 300; now < 600300; now += 5) {
++    alarm = updateAlarm(alarm, true, 90);
++    const Direction wanted = demand(true, 40, ALARM_DUMP_SUPPLY_SETPOINT, 2);
++    v.update(now, wanted, out);
++    if (out.running && !prev) on_since = now;
++    if (!out.running && prev) { const auto duration = elapsed(now,on_since); if (duration > max_run) max_run = duration; }
++    if (out.running) assert(elapsed(now,on_since) <= VALVE_PULSE_MS);
++    prev = out.running;
++  }
++  assert(out.pulses > 20 && max_run == VALVE_PULSE_MS);
++  assert(!updateAlarm(false,true,85));
++  assert(updateAlarm(false,true,86));
++  assert(updateAlarm(true,true,83));
++  assert(!updateAlarm(true,true,82));
++  assert(updateAlarm(true,false,0));
++  Freshness f; assert(!f.current(0)); f.success(start);
++  assert(f.current(start+11999)); assert(!f.current(start+12000));
++  assert(!f.current(start+1)); // cannot revive after an entire wrap
++  f.success(42); assert(f.current(43));
++  Client c; uint16_t dest[8] = {123};
++  c.count = 0; assert(readRegisters(c,2,0,0,dest) == FrameResult::FAIL && dest[0] == 123);
++  c.count = 7; assert(readRegisters(c,2,0,0,dest) == FrameResult::PARTIAL && dest[0] == 123);
++  c.count = 8; c.cut = 5; assert(readRegisters(c,2,0,0,dest) == FrameResult::PARTIAL && dest[0] == 123);
++  c.cut = 8; assert(readRegisters(c,2,0,0,dest) == FrameResult::OK && dest[0] == 700);
++  float set = 60;
++  for (float bad : {0.f,34.f,71.f,65535.f,float(NAN)}) assert(!acceptSetpoint(bad,35,70,set) && set == 60);
++  assert(acceptSetpoint(35,35,70,set)); assert(acceptSetpoint(70,35,70,set));
++  assert(!acceptSetpoint(49,50,65,set)); assert(acceptSetpoint(65,50,65,set));
++  printf("PASS timer rollover, remaining, periodic; valve direction/order/pulse/settling; frames, freshness, setpoints\n");
++  printf("PASS 10-minute alarm: %u pulses, longest continuous RUN %u ms\n", out.pulses,max_run);
++}
+--- /dev/null
++++ b/JonasPLC/test/host/stubs/Arduino.h
+@@ -0,0 +1,26 @@
++#pragma once
++#include <cstdint>
++#include <cmath>
++#include <cassert>
++#define F(x) x
++#define HIGH 1
++#define LOW 0
++#define OUTPUT 1
++#define SERIAL_8N1 0
++#define TFT_BLACK 0
++#define TFT_WHITE 1
++inline uint32_t fake_now = 0;
++inline bool hw_relay[4] = {};
++inline int gpio = 0;
++inline uint32_t run_on_ms = 0, max_run_ms = 0;
++inline uint32_t millis() { return fake_now; }
++inline void delay(uint32_t ms) { fake_now += ms; }
++inline void pinMode(int,int) {}
++inline void digitalWrite(int,int value) { gpio=value; }
++inline int digitalRead(int) { return gpio; }
++struct SerialStub {
++ void begin(int) {}
++ template<class... T> void println(T...) {}
++ template<class... T> void printf(T...) {}
++};
++inline SerialStub Serial, Serial2;
+--- /dev/null
++++ b/JonasPLC/test/host/stubs/ArduinoModbus.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include "Arduino.h"
++#define HOLDING_REGISTERS 0
++struct ModbusStub {
++ int nt_count=8, dial_count=8, count=0, pos=0;
++ uint16_t nt[8]={700,600,400,800,500,400,0,0};
++ uint16_t dial[9]={0,0,0,0,0,60,0,55,0};
++ uint16_t* current=nullptr;
++ unsigned writes=0;
++ bool begin(int,int) {return true;}
++ void transaction() { assert(!hw_relay[2]); fake_now+=100; }
++ int requestFrom(int id,int,int,int) {
++   transaction(); current=id==2?nt:dial; count=id==2?nt_count:dial_count; pos=0; return count;
++ }
++ int available() {return count-pos;}
++ long read() {return current[pos++];}
++ bool holdingRegisterWrite(int,int addr,uint16_t val) { transaction(); ++writes; if(dial_count<=0)return false; dial[addr]=val; return true; }
++ bool coilWrite(int,int,int) {transaction(); ++writes; return dial_count>0;}
++};
++inline ModbusStub ModbusRTUClient;
+--- /dev/null
++++ b/JonasPLC/test/host/stubs/ArduinoRS485.h
+@@ -0,0 +1,2 @@
++#pragma once
++struct RS485Class { template<class... T> RS485Class(T...) {} };
+--- /dev/null
++++ b/JonasPLC/test/host/stubs/M5StamPLC.h
+@@ -0,0 +1,30 @@
++#pragma once
++#include "Arduino.h"
++struct DisplayStub {
++ void startWrite() { assert(!hw_relay[2]); }
++ void endWrite() {}
++ template<class... T> void fillScreen(T...) {}
++ template<class... T> void setTextColor(T...) {}
++ template<class... T> void setTextDatum(T...) {}
++ template<class... T> void setTextSize(T...) {}
++ template<class... T> void setCursor(T...) {}
++ template<class... T> void println(T...) {}
++ template<class... T> void printf(T...) {}
++ template<class... T> void setRotation(T...) {}
++ template<class... T> void setBrightness(T...) {}
++};
++struct PLCStub {
++ DisplayStub Display;
++ void begin() {}
++ void writePlcRelay(int i,bool value) {
++   if (i == 3) assert(!hw_relay[2]);
++   if (i == 2 && value && !hw_relay[i]) run_on_ms = fake_now;
++   if (i == 2 && !value && hw_relay[i]) {
++     const uint32_t duration = fake_now - run_on_ms;
++     if (duration > max_run_ms) max_run_ms = duration;
++     assert(duration <= 1000);
++   }
++   hw_relay[i]=value;
++ }
++};
++inline PLCStub M5StamPLC;
+--- /dev/null
++++ b/JonasPLC/test/host/stubs/M5Unified.h
+@@ -0,0 +1,5 @@
++#pragma once
++#include "Arduino.h"
++namespace textdatum_t { constexpr int top_left=0; }
++struct M5Stub { int config() {return 0;} void begin(int) {} void update() {assert(!hw_relay[2]);} };
++inline M5Stub M5;
