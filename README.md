@@ -91,8 +91,3 @@ pio run --project-dir Display
 ```
 
 Lokální build adresáře `.pio` nejsou součástí repozitáře; PlatformIO je při sestavení vytvoří znovu.
-
-### Stav ověření
-
-- `Display`: sestavení je úspěšné.
-- `JonasPLC`: s knihovnou M5StamPLC 1.2.0 sestavení aktuálně končí na použití `M5StamPLC.Display` místo metody `M5StamPLC.Display()`.
